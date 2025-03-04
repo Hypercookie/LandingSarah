@@ -1,0 +1,141 @@
+on:
+  push:
+    branches: [ "master" ]
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository}}
+
+jobs:
+  build_and_test:
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step to install Node.js and dependencies
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # Specify the Node.js version
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Tailwind CSS
+        run: npx tailwindcss -i ./src/styles.css -o ./src/output.css
+
+      # Install the cosign tool except on PR
+      # https://github.com/sigstore/cosign-installer
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+        with:
+          cosign-release: 'v2.2.4'
+
+      # Set up BuildKit Docker container builder to be able to build
+      # multi-platform images and export cache
+      # https://github.com/docker/setup-buildx-action
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+        
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      # Build Docker image (without pushing)
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          load: true
+          context: .
+          push: false
+          tags: "sarahmariaroth/landing:test"
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Convert to lowercase
+        id: convert2lowercase
+        run: INPUT=${{ env.IMAGE_NAME }}; echo "VAR_LOWERCASE=${INPUT,,}">>${GITHUB_OUTPUT}
+      # Run the Docker container
+      - name: Run Docker container
+        run: docker run -d -p 3000:3000 --name test-container sarahmariaroth/landing:test
+
+      - name: Wait for container to be ready
+        run: |
+          for i in {1..10}; do
+            if curl --silent --fail http://localhost:3000; then
+              echo "Container is up!"
+              break
+            fi
+            echo "Waiting for container..."
+            sleep 5
+          done
+
+      - name: Test Docker container for 200 OK
+        run: |
+          status_code=$(curl --write-out "%{http_code}" --silent --output /dev/null http://localhost:3000)
+          if [ "$status_code" -ne 200 ]; then
+            echo "Expected HTTP 200, but got $status_code"
+            exit 1
+          fi
+          echo "Received HTTP 200 OK from container."
+
+      - name: Stop and remove Docker container
+        run: docker stop test-container && docker rm test-container
+
+      # Push Docker image if tests pass
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sign the resulting Docker image digest
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.
+      # Sign the resulting Docker image digest except on PRs.
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.  If you would like to publish
+      # transparency data even for private images, pass --force to cosign below.
+      # https://github.com/sigstore/cosign
+      - name: Sign the published Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance.
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
